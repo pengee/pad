@@ -10,6 +10,8 @@
 	import EditorLinkPopover from '$lib/components/editor/EditorLinkPopover.svelte';
 	import RawMarkdownEditor from '$lib/components/editor/RawMarkdownEditor.svelte';
 	import type { Editor as EditorType } from '@tiptap/core';
+	import * as Y from 'yjs';
+	import { CollabProvider } from '$lib/collab/wsProvider.svelte';
 	import FieldEditor from '$lib/components/fields/FieldEditor.svelte';
 	import ItemTimeline from '$lib/components/timeline/ItemTimeline.svelte';
 	import ChildItems from '$lib/components/ChildItems.svelte';
@@ -317,6 +319,25 @@
 	async function loadData() {
 		loading = true;
 		error = '';
+		// Clear per-item state that must NOT leak across navigation.
+		// Without this, navigating from item A (mid-raw-edit) to item B
+		// would either (a) seed B's raw editor with A's live markdown
+		// via rawSeedMarkdown, or (b) cause flushRawIfPending on B to
+		// PATCH A's queued markdown into B. Cancel any in-flight raw
+		// debounce too. Per Codex review round 10.
+		clearTimeout(contentDebounceTimer);
+		contentDebounceTimer = undefined;
+		rawSeedMarkdown = null;
+		rawPendingMarkdown = null;
+		// Reset transient save UI state too. Without this, a stale
+		// raw PATCH that gets discarded by the new race guard
+		// (item.id mismatch) leaves saveStatus pinned at 'saving' on
+		// the next item, which then suppresses SSE/sync refreshes
+		// (the `if (saveStatus === 'saving')` guards above).
+		// Per Codex review round 12.
+		clearTimeout(saveStatusTimer);
+		saveStatusTimer = undefined;
+		saveStatus = 'idle';
 		// Capture the URL parts this load was scoped to. Used in the catch
 		// path to detect whether the user has navigated away before this
 		// request rejected — without this the stale catch would clobber a
@@ -398,6 +419,92 @@
 			pendingNewItemEdit = page.url.searchParams.get('new') === '1';
 		}
 	}
+
+	// ── Yjs / collab provider lifecycle (PLAN-1248 / TASK-1259) ────────
+	// Per loaded item with edit access, mint a fresh Y.Doc and attach a
+	// CollabProvider that opens a WebSocket to /api/v1/collab/{itemID}.
+	// The Y.Doc is passed down to <Editor /> via the `ydoc` prop, which
+	// disables StarterKit history and registers the Collaboration
+	// extension instead (TASK-1258 wiring).
+	//
+	// The lifecycle is keyed on `${item.id}:${canEdit}` — the same key
+	// used to re-mount <Editor /> below. When either changes (item swap
+	// or permission flip) the previous Y.Doc + provider tear down
+	// cleanly and a new pair is constructed. The cleanup function on
+	// $effect runs both on key change and on page unmount.
+	//
+	// View-only viewers (canEdit === false) get the legacy non-collab
+	// editor; they can still observe the markdown snapshot persisted
+	// by the canonical 5s flush (TASK-1260). Wiring a read-only
+	// y-binding for them is a polish step deferred to TASK-1266.
+	// rawMode is included in the collab key because raw-markdown saves
+	// bypass the y-binding entirely (PATCH writes to items.content
+	// directly). Leaving the provider connected during raw mode would
+	// (a) tell the server an applier exists for the item, (b) leave
+	// the in-memory Y.Doc holding pre-raw-save state, and (c) on the
+	// next 5s flush after toggling back, push that stale Y.Doc state
+	// over the user's fresh raw save. Destroying the provider while
+	// rawMode is active gives the CLI/MCP applier path the right
+	// "no active room" answer and lets the regular direct-write path
+	// take care of items.content. Switching back mints a fresh Y.Doc
+	// + reseeds via op-log replay (and TASK-1261's lazy seed for the
+	// post-raw-save markdown). Per Codex review round 2.
+	let ydoc = $state<Y.Doc | null>(null);
+	let collabProvider = $state<CollabProvider | null>(null);
+	const collabKey = $derived(item && canEdit && !rawMode ? item.id : null);
+
+	$effect(() => {
+		if (!collabKey) return;
+		const itemId = collabKey;
+
+		const doc = new Y.Doc();
+		const provider = new CollabProvider(itemId, doc, {
+			// Designated-applier handler: when a CLI / MCP / API caller
+			// PATCHes content while this tab is connected, the server
+			// asks one tab to apply the markdown via the editor's
+			// y-tiptap binding (which translates setContent into Y.Doc
+			// ops, propagating to all peers without overwriting the
+			// canonical items.content from a stale source). Returning
+			// `true` triggers an applier_ack so the server's PATCH
+			// returns 200 immediately instead of waiting for the
+			// applier-timeout fallback (~30s) and then writing
+			// items.content directly. The full ExpiresAtMillis-driven
+			// late-apply guard is TASK-1262's concern.
+			onApplierRequest: async (markdown, _requestID, expiresAtMillis) => {
+				if (!editorInstance) return false;
+				// Pre-mutation late-apply guard. The provider already
+				// gates the ack on expiry but the actual setContent
+				// is owned here; gating the mutation itself is the
+				// only way to truly prevent a stale apply when the
+				// handler crosses the deadline. Per Codex review
+				// round 3 — the provider's post-check alone only
+				// suppresses the ack, not the side effect.
+				if (expiresAtMillis > 0 && Date.now() > expiresAtMillis) {
+					return false;
+				}
+				try {
+					editorInstance.commands.setContent(markdown);
+					return true;
+				} catch (err) {
+					console.warn('collab: setContent failed', err);
+					return false;
+				}
+			},
+		});
+
+		ydoc = doc;
+		collabProvider = provider;
+
+		return () => {
+			provider.destroy();
+			doc.destroy();
+			// Defensive — only clear the slot if it still holds the
+			// pair we created. A reactive churn that swapped a new
+			// pair in before this cleanup ran shouldn't get clobbered.
+			if (ydoc === doc) ydoc = null;
+			if (collabProvider === provider) collabProvider = null;
+		};
+	});
 
 	// Handle the ?new=1 auto-edit-title flow reactively. canEdit may flip
 	// from false → true after loadData() resolves (workspace layout fires
@@ -510,6 +617,21 @@
 	}
 
 	function handleContentUpdate(markdown: string) {
+		// Suppress the legacy 1.2s autosave when the collab provider
+		// owns this editor's content. Routing the PATCH through the
+		// server while a provider is connected would loop the
+		// applier protocol back to this same tab (a no-op
+		// round-trip), then set input.Content = nil server-side so
+		// items.content never gets the snapshot — leaving canonical
+		// markdown stale for search / share-page / API consumers.
+		// TASK-1260 introduces the proper 5s idle flush that bypasses
+		// applier with a `?source=collab-flush` semantic; this guard
+		// is the temporary stop-gap for the inter-PR window. Per
+		// Codex review round 4.
+		if (collabProvider) {
+			editorStore.setDirty(true);
+			return;
+		}
 		clearTimeout(contentDebounceTimer);
 		editorStore.setDirty(true);
 		contentDebounceTimer = setTimeout(() => {
@@ -537,24 +659,157 @@
 		}, 1200);
 	}
 
+	// Latest raw markdown that hasn't yet been PATCHed. Tracked
+	// alongside contentDebounceTimer so toggling out of raw mode
+	// (via flushRawIfPending below) can synchronously land the
+	// pending edit BEFORE the collab provider mints — otherwise the
+	// debounced PATCH fires after the provider is up, gets routed
+	// through the applier path, and races peer state. Per Codex
+	// review round 5.
+	let rawPendingMarkdown: string | null = null;
+
+	// One-shot seed for the raw editor when toggling from rich+collab.
+	// items.content stays stale under collab (handleContentUpdate is
+	// suppressed when the provider is active); without this seed,
+	// RawMarkdownEditor would mount with the pre-collab markdown and
+	// any subsequent save would silently lose the live Y.Doc state.
+	// Reset to null on rich-mode toggle and on item swap. Per Codex
+	// review round 9.
+	let rawSeedMarkdown = $state<string | null>(null);
+
 	function handleRawContentUpdate(markdown: string) {
 		clearTimeout(contentDebounceTimer);
 		editorStore.setDirty(true);
+		rawPendingMarkdown = markdown;
 		contentDebounceTimer = setTimeout(() => {
 			if (!item) return;
 			saveStatus = 'saving';
 			editorStore.setLastSaveTime(Date.now());
+			// Capture the item id this PATCH was scoped to so a
+			// late-arriving response after navigation to a new item
+			// can't apply the old item's snapshot to the new
+			// page state (cross-item bleed). Per Codex review round
+			// 11.
+			const reqItemId = item.id;
 			// Raw mode: content is already in storage format (with [[wiki links]])
-			api.items.update(wsSlug, item.id, { content: markdown }).then((updated) => {
-				item = updated;
+			const toSave = markdown;
+			api.items.update(wsSlug, reqItemId, { content: toSave }).then((updated) => {
+				if (!item || item.id !== reqItemId) return;
 				editorStore.setLastSaveTime(Date.now());
-				editorStore.setDirty(false);
-				showSaved();
+				// Stale-response guard: only swap in the server's
+				// snapshot when no newer raw edit landed during the
+				// PATCH. Otherwise RawMarkdownEditor's content-prop
+				// mirror would reset the textarea mid-keystroke and
+				// drop the queued edit. Mirrors the Round 8 fix in
+				// flushRawIfPending. Per Codex review round 9.
+				if (rawPendingMarkdown === toSave) {
+					item = updated;
+					rawPendingMarkdown = null;
+					editorStore.setDirty(false);
+					showSaved();
+				} else {
+					// Newer pending edit; keep local content, adopt
+					// server-side metadata only. The next debounce
+					// cycle will land the queued edit.
+					item = { ...updated, content: item.content };
+				}
 			}).catch(() => {
+				if (!item || item.id !== reqItemId) return;
 				saveStatus = 'idle';
 				toastStore.show('Failed to save content', 'error');
 			});
 		}, 1200);
+	}
+
+	// True while flushRawIfPending is awaiting a PATCH response.
+	// Used to make the Rich-mode toggle re-entrant-safe and to
+	// surface the in-flight state in the UI on rapid double-clicks.
+	let rawFlushInFlight = false;
+
+	// Cap on flushRawIfPending's drain loop. If the user is typing
+	// fast enough to keep rawPendingMarkdown non-null across this
+	// many PATCH round-trips, return false and force them to click
+	// again — better than spinning indefinitely.
+	const RAW_FLUSH_DRAIN_CAP = 5;
+
+	// flushRawIfPending drains every queued raw edit SYNCHRONOUSLY
+	// (one PATCH per drained snapshot, awaited) and returns true
+	// only when rawPendingMarkdown is null on exit. Callers are
+	// expected to gate state transitions (e.g. enabling collab) on
+	// the return value — a stale rawPendingMarkdown left over from
+	// a fast typist or a failed PATCH would otherwise re-introduce
+	// the "collab active with unsaved raw edit" race the guard is
+	// meant to prevent. Per Codex review round 7.
+	async function flushRawIfPending(): Promise<boolean> {
+		if (!item) return rawPendingMarkdown === null;
+
+		// Re-entrancy: another flush is already running. Wait for
+		// it to settle, then re-evaluate from scratch.
+		if (rawFlushInFlight) {
+			while (rawFlushInFlight) {
+				await new Promise((r) => setTimeout(r, 50));
+			}
+			return rawPendingMarkdown === null;
+		}
+
+		if (rawPendingMarkdown === null) return true;
+
+		rawFlushInFlight = true;
+		// Capture the item id once for the entire drain. If the user
+		// navigates away mid-flush, every iteration's stale response
+		// (including the in-flight one) is discarded so it can't
+		// clobber the newly-loaded item. Per Codex review round 11.
+		const reqItemId = item.id;
+		let lastError = false;
+		try {
+			for (let i = 0; i < RAW_FLUSH_DRAIN_CAP; i++) {
+				const markdown: string | null = rawPendingMarkdown;
+				if (markdown === null) break;
+				clearTimeout(contentDebounceTimer);
+				contentDebounceTimer = undefined;
+				try {
+					saveStatus = 'saving';
+					editorStore.setLastSaveTime(Date.now());
+					const updated = await api.items.update(wsSlug, reqItemId, { content: markdown });
+					if (!item || item.id !== reqItemId) {
+						// Navigation completed during the await;
+						// abort and let the new item's state take
+						// over.
+						return false;
+					}
+					editorStore.setLastSaveTime(Date.now());
+					// Only swap in the server's snapshot when no
+					// newer raw edit arrived during the await.
+					// RawMarkdownEditor mirrors `item.content` into
+					// its textarea unconditionally, so assigning a
+					// stale snapshot here would reset the textarea
+					// from under the user's keystrokes and lose the
+					// queued edit. Per Codex review round 8.
+					if (rawPendingMarkdown === markdown) {
+						item = updated;
+						rawPendingMarkdown = null;
+					} else {
+						// Newer edit pending — keep our local
+						// content but adopt server-side metadata
+						// (timestamps, version, modified_by).
+						item = { ...updated, content: item.content };
+					}
+				} catch {
+					saveStatus = 'idle';
+					toastStore.show('Failed to save content', 'error');
+					lastError = true;
+					break;
+				}
+			}
+			if (!lastError && rawPendingMarkdown === null) {
+				editorStore.setDirty(false);
+				showSaved();
+				return true;
+			}
+			return false;
+		} finally {
+			rawFlushInFlight = false;
+		}
 	}
 
 	let computedOverrides = $state<Record<string, any>>({});
@@ -1128,19 +1383,68 @@
 					<button
 						class="mode-btn"
 						class:active={!rawMode}
-						onclick={() => rawMode = false}
+						onclick={async () => {
+							// Flush any pending raw debounce SYNCHRONOUSLY
+							// before the collab provider mints; otherwise
+							// the deferred PATCH fires post-mint and gets
+							// routed through the applier path.
+							// Stay in raw mode if the flush failed — the
+							// user retains their unsaved edits to retry
+							// or copy out. Per Codex review round 6.
+							const ok = await flushRawIfPending();
+							if (ok) {
+								rawSeedMarkdown = null;
+								rawMode = false;
+							}
+						}}
 						title="Rich text editor"
 					>Rich</button>
 					<button
 						class="mode-btn"
 						class:active={rawMode}
-						onclick={() => rawMode = true}
+						onclick={() => {
+							// When toggling FROM rich+collab TO raw,
+							// the editor's live markdown is the
+							// canonical state — items.content has
+							// been intentionally stale since
+							// handleContentUpdate is suppressed
+							// while the provider is connected
+							// (TASK-1260 will close this with a
+							// proper 5s flush). Capture the live
+							// markdown so RawMarkdownEditor seeds
+							// from Y.Doc state rather than stale
+							// items.content. Per Codex review round
+							// 9.
+							if (collabProvider && editorInstance) {
+								try {
+									const md = (editorInstance.storage as any).markdown?.getMarkdown?.();
+									if (typeof md === 'string') {
+										rawSeedMarkdown = md;
+										// Pre-populate the pending
+										// queue so the first
+										// auto-save actually
+										// persists the live state
+										// to items.content (the
+										// no-room path will then
+										// prune the op-log + write
+										// items.content under the
+										// per-item lock).
+										rawPendingMarkdown = md;
+										editorStore.setDirty(true);
+									}
+								} catch {
+									// Fall through; RawMarkdownEditor
+									// will seed from item.content.
+								}
+							}
+							rawMode = true;
+						}}
 						title="Raw markdown editor"
 					>Markdown</button>
 				</div>
 				{#if rawMode}
 					{#key item.id}
-						<RawMarkdownEditor content={item.content ?? ''} onUpdate={handleRawContentUpdate} readonly={!canEdit} />
+						<RawMarkdownEditor content={rawSeedMarkdown ?? item.content ?? ''} onUpdate={handleRawContentUpdate} readonly={!canEdit} />
 					{/key}
 				{:else}
 					<!--
@@ -1151,9 +1455,42 @@
 						mounted before /me resolves would never gain the drag handle
 						even after canEdit flips true. Per Codex review round 4.
 					-->
-					{#key `${item.id}:${canEdit}`}
-						<Editor content={editorContent} onUpdate={handleContentUpdate} editable={canEdit} onEditor={(e) => editorInstance = e} />
-					{/key}
+					<!--
+						Editable users mount the Editor only AFTER the Y.Doc
+						is constructed by the $effect above — Editor.svelte
+						decides its extension list once at onMount time
+						(StarterKit history vs Collaboration), so a mount
+						with `ydoc=undefined` would never gain Collaboration
+						even after the prop later flips. The conditional
+						gate adds at most a single sub-frame delay (the
+						$effect runs in the same reactive cycle) and
+						guarantees the first mount has the binding
+						registered. Per Codex review round 1.
+
+						View-only viewers (canEdit === false) keep mounting
+						immediately under the legacy non-collab path; their
+						read-only y-binding is deferred to TASK-1266.
+					-->
+					{#if !canEdit}
+						{#key `${item.id}:false`}
+							<Editor
+								content={editorContent}
+								onUpdate={handleContentUpdate}
+								editable={false}
+								onEditor={(e) => editorInstance = e}
+							/>
+						{/key}
+					{:else if ydoc}
+						{#key `${item.id}:true`}
+							<Editor
+								content={editorContent}
+								onUpdate={handleContentUpdate}
+								editable={true}
+								ydoc={ydoc}
+								onEditor={(e) => editorInstance = e}
+							/>
+						{/key}
+					{/if}
 					{#if canEdit}
 						<EditorBubbleMenu
 							editor={editorInstance}

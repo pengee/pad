@@ -148,11 +148,21 @@ func (m *RoomManager) ApplyExternalContent(itemID string, markdown string) error
 	timeouts := []time.Duration{applierFirstTimeout(), applierRetryTimeout()}
 
 	tried := make(map[*websocket.Conn]struct{})
+	// anyWriteSucceeded tracks whether at least one applier_request
+	// reached a peer over the wire. The fallback caller decides
+	// whether to prune the op-log based on the error sentinel; only
+	// "no applier ever received the request" makes pruning safe (no
+	// peer holds an in-memory Y.Doc derived from the now-stale
+	// op-log). Without this distinction a sequence of write failures
+	// followed by no remaining candidates would surface as
+	// ErrAllAppliersTimedOut and skip the safe prune. Per Codex
+	// review round 5.
+	var anyWriteSucceeded bool
 	for attempt := 0; attempt < applierMaxAttempts; attempt++ {
 		applier := room.pickApplier(tried)
 		if applier == nil {
 			// No more candidates left.
-			if attempt == 0 {
+			if !anyWriteSucceeded {
 				return ErrNoApplierAvailable
 			}
 			return ErrAllAppliersTimedOut
@@ -187,9 +197,16 @@ func (m *RoomManager) ApplyExternalContent(itemID string, markdown string) error
 			return fmt.Errorf("marshal applier_request: %w", err)
 		}
 		if err := applier.writeMessage(websocket.TextMessage, payload); err != nil {
-			// Conn write failed (slow / dead). Drop the pending ack
-			// and try the next applier.
+			// Conn write failed (slow / dead). Drop the pending
+			// ack, evict the broken conn from the room (otherwise
+			// it would still count as a "live peer" against
+			// PruneAndApply's len(r.conns) > 0 check, blocking the
+			// safe op-log prune), force-close the underlying WS
+			// so the conn's readLoop wakes up cleanly, and try
+			// the next applier. Per Codex review round 6.
 			room.cancelPendingAck(requestID)
+			room.removeConn(applier)
+			_ = applier.conn.Close()
 			slog.Warn("collab: applier_request write failed; trying next",
 				"item_id", itemID,
 				"client_id", applier.id,
@@ -197,6 +214,7 @@ func (m *RoomManager) ApplyExternalContent(itemID string, markdown string) error
 			)
 			continue
 		}
+		anyWriteSucceeded = true
 
 		// Wait for the ack OR timeout.
 		select {
@@ -223,6 +241,11 @@ func (m *RoomManager) ApplyExternalContent(itemID string, markdown string) error
 		}
 	}
 
+	if !anyWriteSucceeded {
+		// applierMaxAttempts exhausted without ever putting bytes on
+		// the wire. Same recovery profile as no-applier-found.
+		return ErrNoApplierAvailable
+	}
 	return ErrAllAppliersTimedOut
 }
 
@@ -320,19 +343,10 @@ func (r *Room) routeApplierAck(requestID string, fromConn *websocket.Conn) {
 	}
 }
 
-// applierConnCount is a test/debug accessor — number of conns in
-// the room that could be picked as appliers. Holds r.mu so a
-// concurrent removeConn doesn't produce a torn read.
-func (r *Room) applierConnCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.conns)
-}
-
 // applierMutexLockOrder is a documentation marker — the mutex order
 // for the designated-applier paths is:
 //
-//   r.mu (room state) > r.pendingMu (ack tracking)
+//	r.mu (room state) > r.pendingMu (ack tracking)
 //
 // Acquire in that order; release in reverse. registerPendingAck and
 // routeApplierAck hold ONLY pendingMu (no r.mu reentry), so no

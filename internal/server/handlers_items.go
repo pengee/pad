@@ -485,19 +485,51 @@ func (s *Server) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 	//
 	// Field-only PATCHes (input.Content == nil) skip this branch
 	// entirely; they continue straight to UpdateItem unchanged.
+	// fullWriteHandled is set when applyContentViaCollab's directWrite
+	// callback ran the FULL UpdateItem (content + title + fields +
+	// everything) inside the per-item lock. In that case we must not
+	// re-run UpdateItem below — we'd duplicate the write and could
+	// produce two version-history rows. Instead we re-fetch the
+	// post-write snapshot for the response. Per Codex review round 9.
+	var fullWriteHandled bool
+	var fullWriteUpdated *models.Item
 	if input.Content != nil && s.collab != nil {
-		if err := s.applyContentViaCollab(r, item.ID, *input.Content); err == nil {
-			// Applier propagated the change; suppress the direct
-			// items.content write. Other input fields (title,
-			// fields, status) still flow through UpdateItem below.
+		// applyContentViaCollab calls directWrite ONLY on the no-
+		// room/no-applier paths (where pruning the op-log is safe
+		// and we need to land items.content under the per-item
+		// lock). The callback owns the full UpdateItem so a mixed
+		// content + title + fields PATCH stays atomic — Round 8's
+		// content-only split lost atomicity and broke
+		// Store.UpdateItem's content-versioning peek at Title.
+		// Per Codex review round 9.
+		err := s.applyContentViaCollab(r, item.ID, *input.Content, func() error {
+			updated, uerr := s.store.UpdateItem(item.ID, input)
+			if uerr != nil {
+				return uerr
+			}
+			fullWriteHandled = true
+			fullWriteUpdated = updated
+			return nil
+		})
+		if err == nil {
+			// Either the applier path acked (content propagated via
+			// Y.Doc; UpdateItem still needs to run for other fields)
+			// or directWrite ran the full UpdateItem inside the
+			// lock (fullWriteHandled tracks which).
 			input.Content = nil
 		}
-		// Any error path (no room, no applier, all timed out, etc.)
-		// falls through to direct write — graceful degradation. The
-		// helper logs the specifics so operators see degraded paths.
+		// Any error path (e.g. ErrAllAppliersTimedOut, retry
+		// exhaustion) falls through to direct write — graceful
+		// degradation. The helper logs the specifics so operators
+		// see degraded paths.
 	}
 
-	updated, err := s.store.UpdateItem(item.ID, input)
+	var updated *models.Item
+	if fullWriteHandled {
+		updated = fullWriteUpdated
+	} else {
+		updated, err = s.store.UpdateItem(item.ID, input)
+	}
 	if err != nil {
 		writeInternalError(w, err)
 		return
