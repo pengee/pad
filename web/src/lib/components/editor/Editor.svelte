@@ -334,7 +334,7 @@
 	import { workspaceStore } from '$lib/stores/workspace.svelte';
 	import { api } from '$lib/api/client';
 	import { BlockDragHandle } from './block-drag-handle';
-	import { HtmlBlock } from './extensions/htmlBlock';
+	import { HtmlBlock, captureHtmlBlockSnapshot, flipHtmlBlockToSource } from './extensions/htmlBlock';
 	import { SLASH_ITEMS } from './block-types';
 	import {
 		AttachmentImage,
@@ -443,6 +443,19 @@
 			case 'orderedList': c.toggleOrderedList().run(); break;
 			case 'taskList': c.toggleTaskList().run(); break;
 			case 'codeBlock': c.toggleCodeBlock().run(); break;
+			case 'htmlBlock': {
+				// Snapshot existing htmlBlock (pos, html) entries before
+				// insertion so flipHtmlBlockToSource can identify the new
+				// block by elimination — handles all cases including
+				// NodeSelection-replace (after.length === before.length
+				// but the replaced entry's html content differs).
+				if (!editor) break;
+				const before = captureHtmlBlockSnapshot(editor);
+				const insertionPoint = editor.state.selection.from;
+				c.setHtmlBlock({ html: '' }).run();
+				flipHtmlBlockToSource(editor, insertionPoint, before);
+				break;
+			}
 			case 'blockquote': c.toggleBlockquote().run(); break;
 			case 'horizontalRule': c.setHorizontalRule().run(); break;
 			case 'table': c.insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run(); break;

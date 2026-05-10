@@ -15,10 +15,106 @@
  * collapse in TASK-1328.
  */
 
-import { Node } from '@tiptap/core';
+import { InputRule, Node, type Editor } from '@tiptap/core';
 import type MarkdownIt from 'markdown-it';
 import type { Node as ProseMirrorNode } from '@tiptap/pm/model';
 import { sanitizeHtmlBlock } from '$lib/utils/markdown';
+
+/** A single htmlBlock node's identity for snapshot comparison. */
+export interface HtmlBlockSnapshotEntry {
+	pos: number;
+	html: string;
+}
+
+/**
+ * Snapshot every htmlBlock node currently in the editor, recording
+ * BOTH position and `attrs.html` content. The caller pairs this with
+ * `flipHtmlBlockToSource` to disambiguate a just-inserted (or
+ * just-replaced) block from any pre-existing ones.
+ *
+ * Capturing content (not just position) is what makes the helper
+ * correct in the "NodeSelection replaces an existing htmlBlock" case
+ * — `insertContent` over a NodeSelection swaps the existing block
+ * for the new one, leaving `after.length === before.length` but with
+ * the replaced block's content changed (commonly to ''). A
+ * position-only snapshot can't see that change; the content snapshot
+ * does.
+ */
+export function captureHtmlBlockSnapshot(editor: Editor): HtmlBlockSnapshotEntry[] {
+	const snapshot: HtmlBlockSnapshotEntry[] = [];
+	editor.state.doc.descendants((node, pos) => {
+		if (node.type.name !== 'htmlBlock') return;
+		const html = typeof node.attrs.html === 'string' ? (node.attrs.html as string) : '';
+		snapshot.push({ pos, html });
+	});
+	return snapshot;
+}
+
+/**
+ * After inserting an htmlBlock node, defer one frame and synthesise a
+ * click on the new block's preview pane so the user lands directly in
+ * source mode (matches the spec: all three insertion paths land in
+ * source).
+ *
+ * Identifies the new block by walking the post-dispatch htmlBlock
+ * snapshot in document order and matching each entry against the
+ * before-snapshot. A pre-existing block matches an after entry when:
+ *
+ *   - Their `html` content is identical, AND
+ *   - The position is plausibly the before position shifted by
+ *     ProseMirror's transaction mapping. Tolerance window:
+ *       0  → block was before the insertion point (unshifted)
+ *       1  → atom-block insertion shifts later positions by +1
+ *       3  → mid-paragraph split adds 2 paragraph tokens + 1 atom = +3
+ *      -1  → empty-paragraph collapse drops a paragraph token = -1
+ *
+ * The first after entry that *doesn't* match a before entry is the
+ * inserted (or replaced) block. This works uniformly for:
+ *   - Plain insert at empty paragraph / end of paragraph / mid-paragraph
+ *   - Insert adjacent to an existing htmlBlock
+ *   - Insert that replaces a NodeSelection on an existing htmlBlock
+ *     (after.length === before.length but the replaced entry's html
+ *     differs from its before image)
+ *
+ * Silent no-op if no new block is found (e.g. the insert failed).
+ */
+export function flipHtmlBlockToSource(
+	editor: Editor,
+	insertionPoint: number,
+	before: HtmlBlockSnapshotEntry[],
+): void {
+	requestAnimationFrame(() => {
+		const { state, view } = editor;
+		const after = captureHtmlBlockSnapshot(editor);
+
+		let bi = 0;
+		let newPos: number | null = null;
+		for (const a of after) {
+			let matched = false;
+			if (bi < before.length) {
+				const b = before[bi];
+				const shift = a.pos - b.pos;
+				const isUnshifted = b.pos < insertionPoint && shift === 0;
+				const isShifted =
+					b.pos >= insertionPoint && (shift === -1 || shift === 1 || shift === 3);
+				if ((isUnshifted || isShifted) && a.html === b.html) {
+					bi++;
+					matched = true;
+				}
+			}
+			if (!matched) {
+				newPos = a.pos;
+				break;
+			}
+		}
+		if (newPos === null) return;
+
+		const dom = view.nodeDOM(newPos) as HTMLElement | null;
+		if (!dom || !dom.classList.contains('html-block')) return;
+		const previewPane = dom.querySelector('.html-block-preview') as HTMLElement | null;
+		previewPane?.click();
+	});
+}
 
 declare module '@tiptap/core' {
 	interface Commands<ReturnType> {
@@ -53,6 +149,11 @@ export const HtmlBlock = Node.create({
 	selectable: true,
 	draggable: true,
 	defining: true,
+	// Higher than the default extension priority (100) so the markdown
+	// shortcut input rule below fires BEFORE CodeBlock's `^```([a-z]+)?…`
+	// rule. Without this, typing ` ```html ` would create a code block
+	// (language=html) instead of an htmlBlock node.
+	priority: 1000,
 
 	addAttributes() {
 		return {
@@ -272,6 +373,46 @@ export const HtmlBlock = Node.create({
 						attrs: { html: options?.html ?? '' },
 					}),
 		};
+	},
+
+	addInputRules() {
+		// Markdown shortcut: typing ` ```html ` followed by a space or newline
+		// at the start of an empty paragraph creates a new htmlBlock node.
+		// Mirrors CodeBlock's textblockTypeInputRule pattern but materialises
+		// an atom node (the htmlBlock leaf) instead of a wrapped textblock.
+		// Higher extension priority (1000, set above) ensures this fires
+		// before CodeBlock's broader `^```([a-z]+)?…` rule.
+		//
+		// `this.editor` is captured via lexical scope — TipTap's InputRule
+		// handler config does NOT pass `editor` directly. By the time the
+		// rule fires, the extension instance has been bound to the editor.
+		const extension = this;
+		return [
+			new InputRule({
+				find: /^```html[\s\n]$/,
+				handler: ({ state, range }) => {
+					// Snapshot pre-dispatch htmlBlock entries (pos + html)
+					// so the flip helper can disambiguate the new block
+					// from any existing ones, including the replace-existing
+					// case where after.length === before.length. state.doc
+					// here is the pre-dispatch document.
+					const before: HtmlBlockSnapshotEntry[] = [];
+					state.doc.descendants((node, pos) => {
+						if (node.type.name !== 'htmlBlock') return;
+						const html = typeof node.attrs.html === 'string' ? (node.attrs.html as string) : '';
+						before.push({ pos, html });
+					});
+					state.tr.replaceRangeWith(
+						range.from,
+						range.to,
+						extension.type.create({ html: '' }),
+					);
+					if (extension.editor) {
+						flipHtmlBlockToSource(extension.editor, range.from, before);
+					}
+				},
+			}),
+		];
 	},
 
 	addStorage() {
