@@ -472,6 +472,26 @@ export const api = {
 		plansProgress: (ws: string) =>
 			request<{item_id: string; total: number; done: number}[]>(`/workspaces/${ws}/plans-progress`),
 
+		/**
+		 * Markdown-checkbox progress for items in a single collection.
+		 * The server scans `- [ ]` / `- [x]` markers in each item's
+		 * `content` and returns `{item_id, total, done}` for items with
+		 * at least one checkbox. Pairs with `listIndex` (TASK-1349):
+		 * the index endpoint omits content for bandwidth, this endpoint
+		 * supplies the small derived counts the views need to render
+		 * progress badges.
+		 */
+		collectionCheckboxProgress: (
+			ws: string,
+			coll: string,
+			opts?: { includeArchived?: boolean }
+		) =>
+			request<{item_id: string; total: number; done: number}[]>(
+				`/workspaces/${ws}/collections/${coll}/checkbox-progress${qs({
+					include_archived: opts?.includeArchived ? 'true' : undefined,
+				})}`
+			),
+
 		/** Star an item for the current user (idempotent) */
 		star: (ws: string, itemSlug: string) =>
 			request<void>(`/workspaces/${ws}/items/${itemSlug}/star`, {
