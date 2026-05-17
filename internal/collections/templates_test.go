@@ -887,6 +887,58 @@ func TestBlankTemplateExcludesSoftwareCollections(t *testing.T) {
 	}
 }
 
+// TestBlankTemplateUsesMinimalVocabularies locks in the design choice
+// from PLAN-1496 / TASK-1498: the blank template's seeded system
+// collections use deliberately tiny trigger/scope option sets so the
+// template doesn't leak a domain. The /pad onboard playbook is
+// expected to broaden these via `pad collection update` (TASK-1510)
+// once the interview reveals what the workspace's actual vocabulary
+// should be (software gets on-commit/on-implement, hiring gets
+// on-candidate-advance, etc.).
+//
+// If this test breaks, it means someone added a domain-flavored
+// trigger or scope to the blank seed — that change needs a different
+// task and a fresh design conversation.
+func TestBlankTemplateUsesMinimalVocabularies(t *testing.T) {
+	// Literal expected slices — NOT the BlankConventionTriggers /
+	// BlankPlaybookTriggers vars. Comparing against those would be
+	// tautological (the template is built from them, so widening
+	// the var would silently widen the "minimal" definition).
+	// Codex round-1 finding on PR #575 fixed this.
+	const (
+		alwaysTrigger = "always"
+		manualTrigger = "manual"
+		allScope      = "all"
+	)
+	wantConventionTriggers := []string{alwaysTrigger}
+	wantConventionScopes := []string{allScope}
+	wantPlaybookTriggers := []string{manualTrigger}
+	wantPlaybookScopes := []string{allScope}
+
+	tmpl := GetTemplate("blank")
+	if tmpl == nil {
+		t.Fatal("blank template missing")
+	}
+	for _, c := range tmpl.Collections {
+		switch c.Slug {
+		case "conventions":
+			if got := findFieldOptions(c, "trigger"); !reflect.DeepEqual(got, wantConventionTriggers) {
+				t.Errorf("conventions.trigger options = %v, want %v (minimal seed)", got, wantConventionTriggers)
+			}
+			if got := findFieldOptions(c, "scope"); !reflect.DeepEqual(got, wantConventionScopes) {
+				t.Errorf("conventions.scope options = %v, want %v (minimal seed)", got, wantConventionScopes)
+			}
+		case "playbooks":
+			if got := findFieldOptions(c, "trigger"); !reflect.DeepEqual(got, wantPlaybookTriggers) {
+				t.Errorf("playbooks.trigger options = %v, want %v (minimal seed)", got, wantPlaybookTriggers)
+			}
+			if got := findFieldOptions(c, "scope"); !reflect.DeepEqual(got, wantPlaybookScopes) {
+				t.Errorf("playbooks.scope options = %v, want %v (minimal seed)", got, wantPlaybookScopes)
+			}
+		}
+	}
+}
+
 // TestBlankTemplateAppearsInPicker verifies the blank template is surfaced
 // by GroupTemplatesByCategory under a Custom group. The picker iterates
 // this helper, so a missing Custom group would hide the template entirely.
