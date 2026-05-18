@@ -6,12 +6,14 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/ory/fosite"
 
 	"github.com/PerpetualSoftware/pad/internal/oauth"
+	"github.com/PerpetualSoftware/pad/internal/store"
 )
 
 // MCPBearerAuth is the auth gate for the /mcp Streamable HTTP endpoint.
@@ -353,28 +355,143 @@ func (s *Server) handleMCPOAuthAuth(w http.ResponseWriter, r *http.Request, toke
 	// connected-apps page (TASK-954) keys revoke + last-used on.
 	ctx = WithMCPTokenIdentity(ctx, "oauth", ar.GetID())
 
-	// Stash the workspace allow-list set at consent time (TASK-952)
-	// so RequireWorkspaceAccess can gate workspace access per-token
-	// (TASK-953). Reading from session.Extra goes through the typed
-	// AllowedWorkspaces accessor so JSON round-trip handling
-	// ([]interface{} vs []string) is centralized in oauth.Session.
+	// Stash the workspace allow-list onto the request context so
+	// RequireWorkspaceAccess can gate workspace access per-token
+	// (TASK-953). Two sources of truth during PLAN-1519's transition:
 	//
-	// Three shapes arrive here:
-	//   - nil — pre-TASK-952 token (no consent payload). Treated by
-	//     RequireWorkspaceAccess as "no token-level gate"; standard
-	//     membership applies.
-	//   - ["*"] — wildcard. Same effective behaviour as nil for the
-	//     gate: any workspace the user is a member of is allowed.
-	//   - [slug-a, slug-b, ...] — explicit allow-list. Workspaces
-	//     NOT in this set are rejected before the membership check
-	//     even runs.
+	//   1. Legacy session.Extra path (TASK-952). Per-token, re-minted
+	//      on every refresh rotation. Used everywhere pre-Phase-C.
+	//   2. New oauth_connections + oauth_connection_workspaces tables
+	//      (TASK-1520). Per-grant-chain, keyed by request_id, survives
+	//      rotation natively. Write path lands in Phase C; until then
+	//      the tables are empty and the dual-read is a no-op.
+	//
+	// Allowed-when policy (the "OR" gate from IDEA-1517 §2):
+	//
+	//   - If EITHER source says "unrestricted" (nil from Extra, or
+	//     all_current_workspaces=1 from oauth_connections, or ["*"]
+	//     wildcard from Extra) → stash nothing; downstream membership
+	//     check is the only gate.
+	//   - Otherwise → stash the UNION of both source slug lists.
+	//     A workspace is allowed iff it appears in either list.
+	//
+	// The OR-on-allow semantic is what makes the migration safe: a
+	// token that was issued pre-Phase-C with an explicit Extra
+	// allow-list still passes (Extra path covers it); a token issued
+	// post-Phase-C with rows ONLY in the new tables also passes (new
+	// path covers it). No request loses access during the transition.
+	//
+	// Hot-path cost: one PK lookup against oauth_connections per
+	// request, plus one indexed scan + small join when the
+	// all_current_workspaces flag is false. Both queries hit indexed
+	// columns; total overhead is sub-millisecond per call (see
+	// PLAN-1519's Risks section + the bench in
+	// internal/store/bench_oauth_connections_test.go).
+	var extraAllowed []string
 	if oauthSession, ok := session.(*oauth.Session); ok {
-		if allowed := oauthSession.AllowedWorkspaces(); allowed != nil {
-			ctx = WithTokenAllowedWorkspaces(ctx, allowed)
+		extraAllowed = oauthSession.AllowedWorkspaces()
+	}
+	access, accessErr := s.store.GetOAuthConnectionAccess(ar.GetID())
+	if accessErr != nil {
+		// I/O error reading the connection — fail CLOSED. We cannot
+		// know whether this grant is scoped or unrestricted without a
+		// successful read; falling through to the legacy-Extra-only
+		// path would silently widen a post-Phase-C connection (where
+		// the new tables are authoritative and session.Extra is empty
+		// by design) into "no allow-list," granting access to every
+		// workspace the user is a member of. Codex review #581 round
+		// 1 caught the regression.
+		//
+		// Mirrors the IntrospectToken storage-error policy a few
+		// branches up: storage failures collapse to a 401 rather than
+		// a 500 because (a) we cannot validate the grant, so the
+		// client MUST not proceed, and (b) a spec-shaped 401 + retry
+		// is the same recovery path the client would take for a
+		// transient outage anyway. The slog.Warn lets ops spot the
+		// underlying DB issue via existing alerting.
+		slog.Warn("oauth_connections access lookup failed; failing closed",
+			"request_id", ar.GetID(), "error", accessErr)
+		if s.metrics != nil {
+			s.metrics.MCPAuthzDenialsTotal.WithLabelValues("connection_lookup_error").Inc()
 		}
+		s.writeMCPUnauthorized(w, r, "invalid_token", "Token validation failed; please retry.")
+		return
+	}
+	if allowed := mergeAllowedWorkspaces(extraAllowed, access); allowed != nil {
+		ctx = WithTokenAllowedWorkspaces(ctx, allowed)
 	}
 
 	next.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// mergeAllowedWorkspaces computes the effective workspace allow-list
+// for an OAuth-authenticated MCP request, OR-merging the two sources
+// described in handleMCPOAuthAuth's stashing block.
+//
+// Returns nil iff EITHER source declares the request unrestricted:
+//
+//   - extra == nil — no allow-list in session.Extra (pre-TASK-952
+//     token or one that omitted the key).
+//   - extra contains "*" — wildcard from the legacy consent flow.
+//   - access.HasConnection && access.AllCurrentWorkspaces — wildcard
+//     from the new-table consent flow.
+//
+// Otherwise returns the lexicographically-sorted, deduplicated union
+// of (extra slugs that aren't "*") and access.WorkspaceSlugs. An empty
+// non-nil slice is fail-closed (consent flow rejected; defense in
+// depth — same posture as the existing AllowedWorkspaces semantic).
+//
+// Pulled out as a free function so the policy can be unit-tested
+// without spinning up the OAuth server. The integration with fosite
+// + introspection lives in handleMCPOAuthAuth above.
+func mergeAllowedWorkspaces(extra []string, access store.OAuthConnectionAccess) []string {
+	// Case 1: connection says unrestricted → no gate regardless of
+	// what Extra holds. The new-tables path "winning" here matches
+	// the IDEA-1517 §2 design where all_current_workspaces=1 IS the
+	// wildcard semantic; Phase-C backfill maps the old ["*"] / nil
+	// shapes onto the flag.
+	if access.HasConnection && access.AllCurrentWorkspaces {
+		return nil
+	}
+	// Case 2: Extra has the wildcard sentinel → no gate. Even if the
+	// new-tables side has a (presumably stale) explicit list, the
+	// user-granted wildcard wins per "allow if either source allows."
+	for _, s := range extra {
+		if s == "*" {
+			return nil
+		}
+	}
+	// Case 3: Extra unset AND no connection row → no gate. Pre-TASK-952
+	// + pre-Phase-C tokens take this path (legacy "no allow-list at
+	// all" behaviour).
+	if extra == nil && !access.HasConnection {
+		return nil
+	}
+	// Case 4: explicit allow-list on at least one side. Union them.
+	seen := make(map[string]struct{}, len(extra)+len(access.WorkspaceSlugs))
+	union := make([]string, 0, len(extra)+len(access.WorkspaceSlugs))
+	add := func(s string) {
+		if s == "" || s == "*" {
+			return
+		}
+		if _, dup := seen[s]; dup {
+			return
+		}
+		seen[s] = struct{}{}
+		union = append(union, s)
+	}
+	for _, s := range extra {
+		add(s)
+	}
+	for _, s := range access.WorkspaceSlugs {
+		add(s)
+	}
+	sort.Strings(union)
+	// Non-nil empty slice is the fail-closed "consent existed but
+	// scoped to nothing" signal — keep it as []string{} rather than
+	// converting to nil, so downstream sees "explicit empty list"
+	// instead of "no gate."
+	return union
 }
 
 // audienceContains reports whether haystack contains needle, treating
