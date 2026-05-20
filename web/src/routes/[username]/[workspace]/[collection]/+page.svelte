@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { api, PadApiError } from '$lib/api/client';
 	import type { Collection, Item, QuickAction, View, ViewConfig } from '$lib/types';
-	import { parseSettings, parseFields, parseSchema, getStatusOptions, itemUrlId } from '$lib/types';
+	import { parseSettings, parseFields, parseSchema, getStatusOptions, itemUrlId, formatItemRef } from '$lib/types';
 	import BoardView from '$lib/components/collections/BoardView.svelte';
 	import ListView from '$lib/components/collections/ListView.svelte';
 	import TableView from '$lib/components/collections/TableView.svelte';
@@ -24,6 +24,7 @@
 	import { localIndex } from '$lib/stores/localIndex.svelte';
 	import { localSearch, parseSearchQuery } from '$lib/stores/localSearch.svelte';
 	import { createScrollRestoration } from '$lib/scroll/restore.svelte';
+	import { confirmOpenChildrenOrThrow, isOpenChildrenError } from '$lib/items/openChildrenError';
 
 	type ViewMode = 'list' | 'board' | 'table';
 
@@ -763,15 +764,52 @@
 		if (!wsSlug) return;
 		const fields = parseFields(item);
 		fields[groupField] = newValue;
+		const fieldsPayload = JSON.stringify(fields);
+		const ws = wsSlug;
+		const parentRef = formatItemRef(item) ?? item.slug;
+
+		const doUpdate = (force: boolean) =>
+			api.items.update(ws, item.id, { fields: fieldsPayload, ...(force ? { force: true } : {}) });
+
 		try {
-			const updated = await api.items.update(wsSlug, item.id, {
-				fields: JSON.stringify(fields)
-			});
+			const updated = await doUpdate(false);
 			// Push the canonical post-update row into the local index;
 			// the `items` derived view re-renders automatically.
-			localIndex.upsert(wsSlug, updated);
+			localIndex.upsert(ws, updated);
 			toastStore.show(`Moved to ${formatLabel(newValue)}`, 'success');
 		} catch (e) {
+			// BUG-1538 / TASK-1539: the server's open-children guard
+			// (IDEA-1494) returns a structured 409 when transitioning a
+			// parent to a terminal status while it still has open
+			// children. Branch on the error shape so a USER cancel of
+			// the modal doesn't get logged as an "update failure" and
+			// the toast/log noise matches user intent.
+			if (isOpenChildrenError(e)) {
+				let forced;
+				try {
+					forced = await confirmOpenChildrenOrThrow(e, parentRef, () => doUpdate(true));
+				} catch (retryErr) {
+					// The retry-with-force itself failed (network /
+					// 500 / fresh validation error). Surface that
+					// distinctly from the original guard.
+					const msg = retryErr instanceof Error ? retryErr.message : 'Failed to update status';
+					console.error('Forced status update failed:', retryErr);
+					toastStore.show(msg, 'error');
+					throw retryErr;
+				}
+				if (forced) {
+					localIndex.upsert(ws, forced);
+					toastStore.show(`Moved to ${formatLabel(newValue)}`, 'success');
+					return;
+				}
+				// User cancelled the override. Quiet info toast — this
+				// is an intentional no-op, not a failure. Re-throw so
+				// the BoardView drag-handler can unwind its optimistic
+				// reorder.
+				toastStore.show('Status change cancelled', 'info');
+				throw e;
+			}
+			// Any other failure mode — network, validation, 500, etc.
 			console.error('Failed to update item:', e);
 			toastStore.show('Failed to update status', 'error');
 			throw e; // Re-throw so BoardView knows the move failed

@@ -62,9 +62,19 @@ const BASE = '/api/v1';
 
 class PadApiError extends Error {
 	code: string;
+	/**
+	 * Structured details for error codes that carry recovery
+	 * information. Shape varies by code; call sites branching on
+	 * `code` cast to the matching payload. The canonical consumer
+	 * today is `open_children` (IDEA-1494 / BUG-1538), whose details
+	 * carry `{ open_children, hidden_blocker_count, done_field,
+	 * attempted_value }`. Undefined for codes that don't supply it.
+	 */
+	details?: Record<string, unknown>;
 	constructor(err: ApiError) {
 		super(err.message);
 		this.code = err.code;
+		this.details = err.details;
 	}
 }
 
@@ -660,15 +670,32 @@ export const api = {
 				method: 'POST'
 			}),
 
-		move: (ws: string, slug: string, targetCollection: string, fieldOverrides?: Record<string, any>) =>
-			request<Item>(`/workspaces/${ws}/items/${slug}/move`, {
-				method: 'POST',
-				body: JSON.stringify({
-					target_collection: targetCollection,
-					field_overrides: fieldOverrides,
-					source: 'web'
-				})
-			}),
+		/**
+		 * Move an item to a different collection. The server applies
+		 * the same open-children guard the PATCH path uses (IDEA-1494)
+		 * — pass `force: true` to override when moving a parent whose
+		 * current done-field value would land terminal in the target
+		 * collection. Mirrors the CLI's `--force` and the server's
+		 * `?force=true` query param on POST /move.
+		 */
+		move: (
+			ws: string,
+			slug: string,
+			targetCollection: string,
+			fieldOverrides?: Record<string, any>,
+			opts?: { force?: boolean }
+		) =>
+			request<Item>(
+				`/workspaces/${ws}/items/${slug}/move${opts?.force ? '?force=true' : ''}`,
+				{
+					method: 'POST',
+					body: JSON.stringify({
+						target_collection: targetCollection,
+						field_overrides: fieldOverrides,
+						source: 'web'
+					})
+				}
+			),
 
 		/** Get child items linked to a parent item */
 		children: (ws: string, slug: string) =>

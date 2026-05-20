@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { tick, onMount, onDestroy } from 'svelte';
-	import { api, type ImportURLResponse } from '$lib/api/client';
+	import { api, PadApiError, type ImportURLResponse } from '$lib/api/client';
+	import { confirmOpenChildrenOrThrow, isOpenChildrenError } from '$lib/items/openChildrenError';
 	import { marked } from 'marked';
 	import { collectionStore } from '$lib/stores/collections.svelte';
 	import { syncService } from '$lib/services/sync.svelte';
@@ -1043,12 +1044,61 @@
 	async function updateField(key: string, value: any) {
 		if (!item) return;
 		const updated = { ...fields, [key]: value };
+		const payload = JSON.stringify(updated);
+		const targetItem = item;
+		const targetWs = wsSlug;
 		saveStatus = 'saving';
+
+		const doUpdate = (force: boolean) =>
+			api.items.update(targetWs, targetItem.id, {
+				fields: payload,
+				...(force ? { force: true } : {})
+			});
+
 		try {
-			item = await api.items.update(wsSlug, item.id, { fields: JSON.stringify(updated) });
+			const fresh = await doUpdate(false);
+			if (item && item.id === targetItem.id) item = fresh;
 			showSaved();
-		} catch {
+		} catch (e) {
+			// BUG-1538 / TASK-1539: same open-children-guard recovery
+			// path as the collection page's handleStatusChange. When the
+			// user is editing the done-field (status) inline on the
+			// detail page, surface the structured 409 and offer to
+			// force-override instead of toasting a vague "Failed to
+			// save".
+			if (isOpenChildrenError(e)) {
+				const parentRef = formatItemRef(targetItem) ?? targetItem.slug;
+				let forced;
+				try {
+					forced = await confirmOpenChildrenOrThrow(e, parentRef, () => doUpdate(true));
+				} catch (retryErr) {
+					// The force retry itself failed (network / 500 /
+					// fresh validation error after the override).
+					saveStatus = 'idle';
+					const msg = retryErr instanceof Error ? retryErr.message : 'Failed to save';
+					console.error('Forced field update failed:', retryErr);
+					toastStore.show(msg, 'error');
+					return;
+				}
+				if (forced) {
+					if (item && item.id === targetItem.id) item = forced;
+					showSaved();
+					return;
+				}
+				// User declined to override. Snap the on-page field back
+				// to its prior value by leaving `item.fields` untouched
+				// (FieldEditor re-renders from `value` prop) and drop
+				// the in-flight save indicator. Force `item` to a fresh
+				// reference so child components re-prop unambiguously
+				// even if they cache by identity.
+				saveStatus = 'idle';
+				if (item && item.id === targetItem.id) item = { ...item };
+				toastStore.show('Status change cancelled', 'info');
+				return;
+			}
+			// Any other failure mode — network, validation, 500, etc.
 			saveStatus = 'idle';
+			console.error('Failed to save field:', e);
 			toastStore.show('Failed to save', 'error');
 		}
 	}
@@ -1866,11 +1916,68 @@
 		if (!item || moving) return;
 		moving = true;
 		showMoveMenu = false;
+		// Capture FULL route identity (workspace, username, source
+		// slug, source item id, parent ref) at the moment the user
+		// kicked off the move. If the user navigates while the
+		// open-children modal is up, we don't want a confirmed force
+		// retry to fire against the new route's workspace — that
+		// could move the wrong item (Codex review round 2 P1).
+		const sourceItem = item;
+		const sourceSlug = item.slug;
+		const sourceWs = wsSlug;
+		const sourceUsername = username;
+		const sourceCollSlug = collSlug;
+		const sourceItemSlug = itemSlug;
+		const parentRef = formatItemRef(sourceItem) ?? sourceItem.slug;
+		const doMove = (force: boolean) =>
+			api.items.move(sourceWs, sourceSlug, targetSlug, undefined, force ? { force: true } : undefined);
+		// After the modal resolves, only honor the success path's
+		// navigation/toast if the page is STILL on the source item.
+		// We check both `item.id` (cheap object-identity guard) AND
+		// the route params (page.params.{username,workspace,
+		// collection,slug}) — during same-component navigation `item`
+		// can briefly still hold the old object while the URL has
+		// already advanced. Comparing both closes that race
+		// (Codex review round 3 P1). Stale resolutions complete
+		// silently rather than yanking the user back.
+		const navIfStillCurrent = (toSlug: string) => {
+			const itemStillCurrent = item && item.id === sourceItem.id;
+			const routeStillCurrent =
+				wsSlug === sourceWs &&
+				username === sourceUsername &&
+				collSlug === sourceCollSlug &&
+				itemSlug === sourceItemSlug;
+			if (itemStillCurrent && routeStillCurrent) {
+				goto(`/${sourceUsername}/${sourceWs}/${targetSlug}/${toSlug}`, { replaceState: true });
+			}
+		};
 		try {
-			const moved = await api.items.move(wsSlug, item.slug, targetSlug);
+			const moved = await doMove(false);
 			toastStore.show(`Moved to ${targetSlug}`, 'success');
-			goto(`/${username}/${wsSlug}/${targetSlug}/${moved.slug}`, { replaceState: true });
+			navIfStillCurrent(moved.slug);
 		} catch (e: any) {
+			// BUG-1538 / Codex review round 1: the server's
+			// open-children guard also fires on POST /move when the
+			// move would land the parent terminal in the target
+			// collection. Wire the same modal + ?force=true override
+			// path used for PATCH status changes.
+			if (isOpenChildrenError(e)) {
+				let forced;
+				try {
+					forced = await confirmOpenChildrenOrThrow(e, parentRef, () => doMove(true));
+				} catch (retryErr: any) {
+					console.error('Forced move failed:', retryErr);
+					toastStore.show(retryErr?.message ?? 'Failed to move item', 'error');
+					return; // outer finally still resets `moving`
+				}
+				if (forced) {
+					toastStore.show(`Moved to ${targetSlug}`, 'success');
+					navIfStillCurrent(forced.slug);
+				} else {
+					toastStore.show('Move cancelled', 'info');
+				}
+				return;
+			}
 			toastStore.show(e.message ?? 'Failed to move item', 'error');
 		} finally {
 			moving = false;
