@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1113,14 +1114,51 @@ func (s *Server) enforceUserPlanLimit(w http.ResponseWriter, userID, feature str
 }
 
 // writePlanLimitError writes a structured 403 response for plan limit violations.
+// The envelope follows the standard {"error":{"code":...,"message":...,"details":{...}}}
+// shape so PadApiError (frontend), cli.APIError (CLI), and the MCP classifier can
+// all parse it uniformly. TASK-788.
 func writePlanLimitError(w http.ResponseWriter, result *store.LimitResult) {
-	writeJSON(w, http.StatusForbidden, map[string]interface{}{
-		"error":       "plan_limit_exceeded",
+	msg := planLimitMessage(result)
+	writeError2(w, http.StatusForbidden, "plan_limit_exceeded", msg, map[string]interface{}{
 		"feature":     result.Feature,
 		"limit":       result.Limit,
 		"current":     result.Current,
 		"plan":        result.Plan,
 		"upgrade_url": "/console/billing",
+	})
+}
+
+// planLimitMessage returns a human-readable statement-of-fact sentence for a
+// plan limit violation. Each surface (web toast, CLI, MCP hint) appends its
+// own upgrade call-to-action so the message itself doesn't repeat it (B1 fix).
+// Uses hyphenated adjective form ("3-member") per B2 fix. TASK-788.
+func planLimitMessage(result *store.LimitResult) string {
+	featureLabel := map[string]string{
+		"items_per_workspace":   "item",
+		"members_per_workspace": "member",
+		"workspaces":            "workspace",
+		"api_tokens":            "API token",
+		"webhooks":              "webhook",
+	}
+	label, ok := featureLabel[result.Feature]
+	if !ok {
+		label = result.Feature
+	}
+	// "3-member", "10-item", "1-workspace", "10-API-token", etc.
+	// Hyphenated form reads as a compound adjective modifying "limit".
+	limitStr := fmt.Sprintf("%d-%s", result.Limit, label)
+	return fmt.Sprintf("You've reached the %s limit on the free plan.", limitStr)
+}
+
+// writeError2 is like writeError but also embeds a details object inside the error
+// envelope. Shape: {"error":{"code":...,"message":...,"details":{...}}}.
+func writeError2(w http.ResponseWriter, status int, code, message string, details map[string]interface{}) {
+	writeJSON(w, status, map[string]interface{}{
+		"error": map[string]interface{}{
+			"code":    code,
+			"message": message,
+			"details": details,
+		},
 	})
 }
 

@@ -1910,6 +1910,14 @@ func inviteCmd() *cobra.Command {
 				return err
 			}
 			if err := client.PostRaw("/workspaces/"+ws+"/members/invite", raw, &result); err != nil {
+				// TASK-788: emit structured marker so MCP stdio classifier
+				// can surface ErrPlanLimitExceeded instead of ErrServerError.
+				if apiErr, ok := err.(*cli.APIError); ok {
+					if apiErr.AsPlanLimit() != nil {
+						cli.WritePlanLimitError(os.Stderr, apiErr)
+						return fmt.Errorf("invite blocked: plan limit reached")
+					}
+				}
 				return err
 			}
 
@@ -2004,6 +2012,14 @@ the agent can use it immediately without re-auth.`,
 				Template: templateFlag,
 			})
 			if err != nil {
+				// TASK-788: emit structured marker before wrapping so the MCP
+				// stdio classifier can surface ErrPlanLimitExceeded with details.
+				if apiErr, ok := err.(*cli.APIError); ok {
+					if apiErr.AsPlanLimit() != nil {
+						cli.WritePlanLimitError(os.Stderr, apiErr)
+						return fmt.Errorf("workspace creation blocked: plan limit reached")
+					}
+				}
 				return fmt.Errorf("create workspace: %w", err)
 			}
 			if formatFlag == "json" {
@@ -3036,6 +3052,14 @@ Run with --help-collections to see available collections and their status values
 
 			item, err := client.CreateItem(ws, collSlug, input)
 			if err != nil {
+				// TASK-788: emit structured marker so MCP stdio classifier
+				// can surface ErrPlanLimitExceeded instead of ErrServerError.
+				if apiErr, ok := err.(*cli.APIError); ok {
+					if apiErr.AsPlanLimit() != nil {
+						cli.WritePlanLimitError(os.Stderr, apiErr)
+						return fmt.Errorf("item creation blocked: plan limit reached")
+					}
+				}
 				return err
 			}
 
@@ -6228,6 +6252,12 @@ Examples:
 
 				item, err := client.CreateItem(ws, "conventions", input)
 				if err != nil {
+					if apiErr, ok := err.(*cli.APIError); ok {
+						if apiErr.AsPlanLimit() != nil {
+							cli.WritePlanLimitError(os.Stderr, apiErr)
+							return fmt.Errorf("convention activation blocked: plan limit reached")
+						}
+					}
 					return err
 				}
 
@@ -6285,6 +6315,12 @@ Examples:
 
 				item, err := client.CreateItem(ws, "playbooks", input)
 				if err != nil {
+					if apiErr, ok := err.(*cli.APIError); ok {
+						if apiErr.AsPlanLimit() != nil {
+							cli.WritePlanLimitError(os.Stderr, apiErr)
+							return fmt.Errorf("playbook activation blocked: plan limit reached")
+						}
+					}
 					return err
 				}
 
@@ -7010,6 +7046,14 @@ Examples:
 
 			hook, err := client.CreateWebhook(ws, input)
 			if err != nil {
+				// TASK-788: emit structured marker so MCP stdio classifier
+				// can surface ErrPlanLimitExceeded instead of ErrServerError.
+				if apiErr, ok := err.(*cli.APIError); ok {
+					if apiErr.AsPlanLimit() != nil {
+						cli.WritePlanLimitError(os.Stderr, apiErr)
+						return fmt.Errorf("webhook creation blocked: plan limit reached")
+					}
+				}
 				return err
 			}
 
