@@ -239,6 +239,25 @@ func (s *Store) tryCreateItem(id, workspaceID, collectionID, slug, ts, fields, t
 		return fmt.Errorf("resolve broken titles: %w", err)
 	}
 
+	// Seed the create-time "entered initial status" transition so an item
+	// created directly in a terminal done-field value (e.g. a retroactively
+	// logged "done" task, or an import) still counts as a completion in
+	// reports (PLAN-1628 / TASK-1637). Resolve the collection's done field
+	// in-tx; skip when it's unset at creation. The deterministic id keeps
+	// this idempotent with the backfill's create-seed for the same item.
+	var schemaJSON, settingsJSON string
+	if err := tx.QueryRow(s.q(`SELECT schema, settings FROM collections WHERE id = ?`), collectionID).Scan(&schemaJSON, &settingsJSON); err == nil {
+		doneKey := doneFieldKeyFromSchemaJSON(schemaJSON, settingsJSON)
+		if initial := extractFieldValue(fields, doneKey); initial != "" {
+			if _, err = tx.Exec(s.q(`
+				INSERT INTO status_transitions (id, item_id, workspace_id, collection_id, field_key, from_status, to_status, created_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`), "create_"+id, id, workspaceID, collectionID, doneKey, "", initial, ts); err != nil {
+				return fmt.Errorf("record create-time status transition: %w", err)
+			}
+		}
+	}
+
 	return tx.Commit()
 }
 
@@ -1668,11 +1687,50 @@ func (s *Store) UpdateItemWithPreCheck(
 		args = append(args, input.Source)
 	}
 
+	// Capture the pre-update status BEFORE the UPDATE runs, so the
+	// transition log below records an accurate from_status. It must reflect
+	// the locked, in-tx state: when a precheck ran, `existing` was already
+	// replaced with the fresh in-tx snapshot above; otherwise `existing` is
+	// the pre-tx read, which a concurrent update (now serialized behind the
+	// workspace/parent locks we hold) could have superseded — re-read in-tx
+	// in that case. Reading here, before the UPDATE, is essential: a re-read
+	// after the UPDATE would see the new status and the hop would vanish.
+	var statusBefore, doneKey string
+	if input.Fields != nil {
+		doneKey = s.doneFieldKey(existing.CollectionID)
+		oldFields := existing.Fields
+		if precheck == nil {
+			if fresh, ferr := s.getItemTx(tx, id); ferr == nil && fresh != nil {
+				oldFields = fresh.Fields
+			}
+		}
+		statusBefore = extractFieldValue(oldFields, doneKey)
+	}
+
 	args = append(args, id)
 	query := fmt.Sprintf("UPDATE items SET %s WHERE id = ?", strings.Join(sets, ", "))
 	_, err = tx.Exec(s.q(query), args...)
 	if err != nil {
 		return nil, fmt.Errorf("update item: %w", err)
+	}
+
+	// Record a structured status transition when the fields blob was part
+	// of this update AND the `status` value actually changed. Written in
+	// the same tx as the item UPDATE so the transition log can never
+	// diverge from the item's persisted status, and — unlike the activity
+	// feed — NOT debounced, so every hop (open → in-progress → done) is its
+	// own row. This is the canonical timestamp source for the Reports
+	// completed-throughput and cycle-time series (PLAN-1628 / TASK-1637).
+	if input.Fields != nil {
+		newStatus := extractFieldValue(*input.Fields, doneKey)
+		if newStatus != "" && newStatus != statusBefore {
+			if _, err = tx.Exec(s.q(`
+				INSERT INTO status_transitions (id, item_id, workspace_id, collection_id, field_key, from_status, to_status, created_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`), newID(), id, existing.WorkspaceID, existing.CollectionID, doneKey, statusBefore, newStatus, ts); err != nil {
+				return nil, fmt.Errorf("record status transition: %w", err)
+			}
+		}
 	}
 
 	// Title rename — cascade to title-form backlinks. Fires whether
@@ -2954,13 +3012,46 @@ func (s *Store) MoveItemWithPreCheck(
 		existing = freshExisting
 	}
 
+	// Capture the pre-move status under lock before the UPDATE, mirroring the
+	// UpdateItemWithPreCheck path: `existing` is the fresh in-tx snapshot when
+	// a precheck ran, otherwise re-read so a concurrent write doesn't make
+	// from_status stale. The done field resolves against the TARGET collection
+	// (where the item now lives and which reports group by); for a move that
+	// also crosses to a collection with a different done field, the old value
+	// read through that key may be empty, which correctly reads as "entered".
+	moveDoneKey := s.doneFieldKey(targetCollectionID)
+	oldFields := existing.Fields
+	if precheck == nil {
+		if fresh, ferr := s.getItemTx(tx, itemID); ferr == nil && fresh != nil {
+			oldFields = fresh.Fields
+		}
+	}
+
+	moveTS := time.Now().UTC().Format(time.RFC3339)
 	_, err = tx.Exec(s.q(`
 		UPDATE items
 		SET collection_id = ?, fields = ?, updated_at = ?, seq = `+nextWorkspaceSeqSubquery+`
 		WHERE id = ? AND deleted_at IS NULL`),
-		targetCollectionID, newFieldsJSON, time.Now().UTC().Format(time.RFC3339), existing.WorkspaceID, itemID)
+		targetCollectionID, newFieldsJSON, moveTS, existing.WorkspaceID, itemID)
 	if err != nil {
 		return nil, fmt.Errorf("move item: %w", err)
+	}
+
+	// A move can carry a status-changing field override (e.g.
+	// `pad item move ... --field status=done`), which rewrites `fields`
+	// outside the UpdateItemWithPreCheck path. Record the transition here
+	// too so status_transitions stays the canonical source for reports
+	// (PLAN-1628 / TASK-1637). collection_id reflects the TARGET collection
+	// the item now lives in. Same tx, not debounced.
+	oldStatus := extractFieldValue(oldFields, moveDoneKey)
+	newStatus := extractFieldValue(newFieldsJSON, moveDoneKey)
+	if newStatus != "" && newStatus != oldStatus {
+		if _, err = tx.Exec(s.q(`
+			INSERT INTO status_transitions (id, item_id, workspace_id, collection_id, field_key, from_status, to_status, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`), newID(), itemID, existing.WorkspaceID, targetCollectionID, moveDoneKey, oldStatus, newStatus, moveTS); err != nil {
+			return nil, fmt.Errorf("record status transition on move: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
