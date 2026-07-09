@@ -1105,9 +1105,48 @@
 	// ~64KB body which dwarfs typical markdown items.
 	$effect(() => {
 		if (typeof window === 'undefined') return;
-		const onBeforeUnload = () => {
+		const onBeforeUnload = (event: BeforeUnloadEvent) => {
+			// Collab path: flush the live Y.Doc snapshot (unchanged).
 			const ctx = activeCollabContext;
 			if (ctx) flushCollabNow(ctx, true);
+
+			// Raw-markdown path (BUG-2024). rawPendingMarkdown holds the
+			// exact debounced-but-unsaved markdown; when non-null there
+			// is up to ~1.2s of typing the collab flush above never
+			// sees. Only when actually dirty — never warn on a clean page.
+			const pendingRaw = rawPendingMarkdown;
+			if (pendingRaw !== null && item) {
+				const reqItemId = item.id;
+				// Cancel any queued debounce so it can't fire a second,
+				// older-content PATCH racing the keepalive one below —
+				// the keepalive request already carries the latest
+				// markdown. (An already-in-flight debounced PATCH would
+				// carry older content, but the debounce spacing makes
+				// one being airborne at unload vanishingly narrow, and
+				// the server's un-versioned content PATCH has never
+				// guarded that ordering; this is strictly better than
+				// the pre-fix total loss of the debounced edit.)
+				clearTimeout(contentDebounceTimer);
+				contentDebounceTimer = undefined;
+				// Fire an immediate keepalive PATCH so the edit survives
+				// page teardown (keepalive holds the request open past
+				// unload — that's the point). If the user cancels the
+				// navigation ("Stay"), clear the dirty state once it
+				// lands so a later unload doesn't re-prompt / re-PATCH
+				// already-saved content.
+				void api.items
+					.update(wsSlug, reqItemId, { content: pendingRaw }, { keepalive: true })
+					.then(() => {
+						if (item && item.id === reqItemId && rawPendingMarkdown === pendingRaw) {
+							rawPendingMarkdown = null;
+							editorStore.setDirty(false);
+						}
+					})
+					.catch(() => {});
+				// Native "unsaved changes" prompt.
+				event.preventDefault();
+				event.returnValue = '';
+			}
 		};
 		window.addEventListener('beforeunload', onBeforeUnload);
 		return () => window.removeEventListener('beforeunload', onBeforeUnload);
