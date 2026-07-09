@@ -88,11 +88,100 @@ class PadApiError extends Error {
 	 *   { feature: string, limit: number, current: number, plan: string, upgrade_url: string }
 	 */
 	details?: Record<string, unknown>;
+	/**
+	 * Milliseconds the client waited (or would have waited) before a
+	 * retry, derived from the 429 `Retry-After` header. Only set on
+	 * `code === 'rate_limited'` errors (TASK-2026); undefined otherwise.
+	 * Lets a caller/UI say "try again in ~Ns" instead of a bare toast.
+	 */
+	retryAfterMs?: number;
 	constructor(err: ApiError) {
 		super(err.message);
 		this.code = err.code;
 		this.details = err.details;
 	}
+}
+
+/**
+ * Server-busy / rate-limit handling (TASK-2026). When the server returns
+ * 429 we honor `Retry-After` for a SINGLE delayed retry of idempotent
+ * GET/HEAD requests, then (if it still 429s) surface a distinct
+ * `rate_limited` PadApiError so the UI can show a "server busy" message
+ * rather than a generic failure. This is the client half of the rate-limit
+ * story; the server-side raise lives separately (IDEA-1842).
+ */
+// Absolute ceiling on how long a single Retry-After delay may block the
+// UI. A hostile or misconfigured `Retry-After: 86400` must not hang the
+// app for a day — clamp to a few seconds and let the user retry by hand.
+const MAX_RETRY_AFTER_MS = 5_000;
+// Backoff used when a 429 arrives with no (or an unparseable) Retry-After
+// header, so the one automatic GET retry still spaces itself out.
+const DEFAULT_RETRY_BACKOFF_MS = 750;
+
+// Global soft cooldown (epoch ms). Every observed 429 pushes this forward
+// to `now + Retry-After` (never backward — see `armRateLimitCooldown`).
+// Before firing an idempotent GET/HEAD we wait out the remaining window
+// (bounded by MAX_RETRY_AFTER_MS) so INDEPENDENT call sites don't burst a
+// busy server — e.g. localIndex.bootstrap's reconcile 429s, then the
+// collection page immediately fires a follow-up deltaSync (Codex P1 on the
+// first cut of TASK-2026). We deliberately do NOT clear this on a
+// successful response: a success from an unrelated request that was already
+// in flight when the 429 landed is not evidence the rate limit lifted
+// (Codex round 2). The cooldown simply expires by wall-clock. Zero = no
+// cooldown active.
+let rateLimitedUntil = 0;
+
+/**
+ * Push the global rate-limit cooldown out to `now + backoffMs`, never
+ * pulling it in. Called on EVERY 429 (including the one that then triggers
+ * the single automatic retry) so a concurrent request started during the
+ * retry's own backoff sleep still sees the cooldown. TASK-2026.
+ */
+function armRateLimitCooldown(backoffMs: number): void {
+	const until = Date.now() + backoffMs;
+	if (until > rateLimitedUntil) rateLimitedUntil = until;
+}
+
+function clampRetryMs(ms: number): number {
+	if (!Number.isFinite(ms) || ms < 0) return 0;
+	return Math.min(ms, MAX_RETRY_AFTER_MS);
+}
+
+/**
+ * Parse an HTTP `Retry-After` header into a clamped millisecond delay.
+ * Supports both wire forms: delta-seconds (`Retry-After: 3`) and an
+ * HTTP-date (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`). Returns null
+ * when the header is absent or unparseable so the caller can fall back to
+ * `DEFAULT_RETRY_BACKOFF_MS`. All results are clamped to
+ * `MAX_RETRY_AFTER_MS`. TASK-2026.
+ */
+export function parseRetryAfterMs(header: string | null | undefined): number | null {
+	if (!header) return null;
+	const trimmed = header.trim();
+	if (trimmed === '') return null;
+	// Delta-seconds form: a bare non-negative integer.
+	if (/^\d+$/.test(trimmed)) {
+		return clampRetryMs(Number(trimmed) * 1000);
+	}
+	// HTTP-date form. Date.parse returns NaN for garbage.
+	const when = Date.parse(trimmed);
+	if (Number.isNaN(when)) return null;
+	const delta = when - Date.now();
+	return clampRetryMs(delta <= 0 ? 0 : delta);
+}
+
+function sleep(ms: number): Promise<void> {
+	if (ms <= 0) return Promise.resolve();
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Returns true when `err` is the distinct 429 server-busy error. Mirrors
+ * the `isPlanLimitError` idiom so call sites can branch on rate limiting
+ * and show a "Server busy, try again shortly" message. TASK-2026.
+ */
+function isRateLimitError(err: unknown): err is PadApiError {
+	return err instanceof PadApiError && err.code === 'rate_limited';
 }
 
 /**
@@ -271,14 +360,41 @@ const AUTH_FORM_401_PATHS = new Set(['/auth/login', '/auth/register', '/auth/2fa
  */
 const CREDENTIAL_RECONFIRM_401_PATHS = new Set(['/auth/delete-account']);
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+async function request<T>(
+	path: string,
+	options?: RequestInit,
+	// Internal flag: true on the single automatic re-invocation after a
+	// 429. Prevents an infinite retry loop if the retried request also
+	// 429s. Never passed by external callers. TASK-2026.
+	rateLimitRetried = false,
+): Promise<T> {
 	const headers: Record<string, string> = { 'Content-Type': 'application/json' };
 
 	// Attach CSRF token for state-changing requests
 	const method = options?.method?.toUpperCase();
+	const isIdempotent = method === undefined || method === 'GET' || method === 'HEAD';
 	if (method && method !== 'GET' && method !== 'HEAD') {
 		const csrf = getCSRFToken();
 		if (csrf) headers['X-CSRF-Token'] = csrf;
+	}
+
+	// Rate-limit cooldown (TASK-2026). If a recent 429 asked us to back
+	// off, wait out the remaining window before firing another idempotent
+	// request so independent call sites don't hammer a busy server. The
+	// internal single-retry (`rateLimitRetried`) already slept, so it
+	// skips this. Non-idempotent writes are never delayed here — they
+	// don't auto-retry and shouldn't be silently stalled by an unrelated
+	// GET's cooldown. The loop re-reads the deadline after each nap so a
+	// cooldown EXTENDED by another 429 mid-sleep is honored (Codex round
+	// 2 P2), but the total wait is capped at MAX_RETRY_AFTER_MS so a
+	// sustained 429 storm can't stall a single request indefinitely.
+	if (isIdempotent && !rateLimitRetried) {
+		const waitStart = Date.now();
+		let remaining = rateLimitedUntil - Date.now();
+		while (remaining > 0 && Date.now() - waitStart < MAX_RETRY_AFTER_MS) {
+			await sleep(Math.min(remaining, MAX_RETRY_AFTER_MS - (Date.now() - waitStart)));
+			remaining = rateLimitedUntil - Date.now();
+		}
 	}
 
 	const resp = await fetch(BASE + path, {
@@ -334,6 +450,36 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 		if (method === undefined || method === 'GET' || method === 'HEAD') {
 			notifyAccessRevoked(path);
 		}
+	}
+	if (resp.status === 429) {
+		// Rate limited (TASK-2026). Honor Retry-After for ONE delayed
+		// retry of idempotent requests; then surface a distinct
+		// `rate_limited` error so callers can show "server busy" rather
+		// than a generic failure.
+		const retryAfterMs = parseRetryAfterMs(resp.headers?.get('Retry-After'));
+		const backoffMs = retryAfterMs ?? DEFAULT_RETRY_BACKOFF_MS;
+		// Arm the global cooldown on EVERY 429 — including this one that we
+		// may be about to retry — so a concurrent idempotent request that
+		// started during the retry's own backoff sleep also backs off
+		// instead of immediately re-hitting the busy server (Codex round 2 P1).
+		armRateLimitCooldown(backoffMs);
+		// Only GET/HEAD auto-retry — retrying a POST/PATCH/DELETE could
+		// duplicate a write the server may have already partially applied.
+		if (isIdempotent && !rateLimitRetried) {
+			await sleep(backoffMs);
+			return request<T>(path, options, true);
+		}
+		// Prefer the server's structured error envelope if present, but
+		// force the distinct `rate_limited` code + a clear message so UI
+		// can branch on it regardless of what the proxy/server sent.
+		const body = await resp.json().catch(() => null);
+		const err = new PadApiError({
+			code: 'rate_limited',
+			message: body?.error?.message || 'Server busy — please try again in a moment.',
+			details: body?.error?.details,
+		});
+		if (retryAfterMs != null) err.retryAfterMs = retryAfterMs;
+		throw err;
 	}
 	if (!resp.ok) {
 		const body = await resp.json().catch(() => null);
@@ -2147,4 +2293,4 @@ export const api = {
 	}
 };
 
-export { PadApiError, isPlanLimitError, planLimitMessage };
+export { PadApiError, isPlanLimitError, planLimitMessage, isRateLimitError };
