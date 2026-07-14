@@ -249,28 +249,21 @@ func serveCmd() *cobra.Command {
 				srv.SetCloudMode(cfg.CloudSecret)
 				slog.Info("Cloud mode enabled")
 
-				// MCP Streamable HTTP transport (PLAN-943 TASK-950).
-				// Mount the public /mcp endpoint + RFC 9728 / RFC 8414
-				// discovery docs. Wired only in cloud mode because:
-				//
-				//   - It requires user-owned PATs (the existing
-				//     workspace-scoped PAT path is rejected — see
-				//     MCPBearerAuth in middleware_mcp_auth.go), so a
-				//     self-host running without users would have no
-				//     usable auth path.
-				//   - The discovery docs reference a public OAuth
-				//     authorization server URL (TASK-951) that only
-				//     exists on the Pad-Cloud deployment.
-				//
-				// Construction shape mirrors `pad mcp serve` (cmd/pad/mcp.go)
-				// minus the stdio runtime: cmdhelp.Doc → MCPServer →
-				// catalog/prompts/meta registration → wrap in Streamable
-				// HTTP transport → hand to *server.Server. Resources
-				// are intentionally skipped for v1 of TASK-950 — the
-				// existing ExecResourceFetcher shells out to the pad
-				// binary, which doesn't carry a per-OAuth-user
-				// credential context. An HTTPResourceFetcher equivalent
-				// is its own follow-up task.
+			// MCP Streamable HTTP transport (PLAN-943 TASK-950).
+			// Mount the public /mcp endpoint + RFC 9728 / RFC 8414
+			// discovery docs. Cloud-mode construction includes OAuth
+			// support (workspace lister, tier-mismatch observer,
+			// verified-email gate). Self-hosted (below) skips those.
+			//
+			// Construction shape mirrors `pad mcp serve` (cmd/pad/mcp.go)
+			// minus the stdio runtime: cmdhelp.Doc → MCPServer →
+			// catalog/prompts/meta registration → wrap in Streamable
+			// HTTP transport → hand to *server.Server. Resources
+			// are intentionally skipped for v1 of TASK-950 — the
+			// existing ExecResourceFetcher shells out to the pad
+			// binary, which doesn't carry a per-OAuth-user
+			// credential context. An HTTPResourceFetcher equivalent
+			// is its own follow-up task.
 				root := cmd.Root()
 				mcpDoc := cmdhelp.Build(root, root, cmdhelp.Options{
 					Binary:   "pad",
@@ -530,6 +523,58 @@ func serveCmd() *cobra.Command {
 				if err := s.BackfillUserPlans("self-hosted"); err != nil {
 					slog.Warn("failed to set self-hosted plans", "error", err)
 				}
+			}
+
+			// Self-hosted MCP Streamable HTTP transport. When
+			// PAD_MCP_PUBLIC_URL is set on a non-cloud server, mount
+			// the public /mcp endpoint so MCP clients (Claude Desktop,
+			// Cursor, etc.) can connect using PATs for authentication.
+			// No OAuth support on self-hosted — discoverability URLs
+			// reference the configured MCP public URL only.
+			//
+			// Construction mirrors the cloud-mode block above minus
+			// OAuth-specific dispatcher config (Lister, OnScopeDenied,
+			// RequireVerifiedEmail).
+			if !cfg.IsCloudServer() && cfg.MCPPublicURL != "" {
+				root := cmd.Root()
+				mcpDoc := cmdhelp.Build(root, root, cmdhelp.Options{
+					Binary:   "pad",
+					Version:  fullVersion(),
+					Homepage: padHomepage,
+					MaxDepth: -1,
+				})
+				mcpSrv := mcpserver.NewServer(mcpserver.Options{Version: fullVersion()})
+				dispatcher := &mcpserver.HTTPHandlerDispatcher{
+					Handler: srv,
+					UserResolver: func(ctx context.Context) *models.User {
+						u, _ := server.CurrentUserFromContext(ctx)
+						return u
+					},
+				}
+				if _, regErr := mcpserver.Register(mcpSrv.MCP(), mcpserver.RegistryOptions{
+					Doc:        mcpDoc,
+					Workspace:  mcpserver.NewSharedWorkspaceState(),
+					Dispatcher: dispatcher,
+					PadVersion: fullVersion(),
+				}); regErr != nil {
+					return fmt.Errorf("register MCP catalog: %w", regErr)
+				}
+				mcpserver.RegisterPrompts(mcpSrv.MCP())
+				mcpserver.RegisterMeta(mcpSrv.MCP(), fullVersion())
+				streamable := mcptransport.NewStreamableHTTPServer(
+					mcpSrv.MCP(),
+					mcptransport.WithEndpointPath("/mcp"),
+					mcptransport.WithSessionIdManager(&padMCPGenerateOnlySessionIDManager{}),
+					mcptransport.WithDisableLocalhostProtection(true),
+				)
+				srv.SetMCPSessionTrackerConfig(
+					parseDurationEnv("PAD_MCP_SESSION_TTL", 0),
+					parseDurationEnv("PAD_MCP_SESSION_SWEEP_INTERVAL", 0),
+				)
+				srv.SetMCPTransport(streamable, cfg.MCPPublicURL, "")
+				slog.Info("MCP /mcp transport mounted (self-hosted)",
+					"public_url", cfg.MCPPublicURL,
+				)
 			}
 
 			// Wire attachment storage. Phase 1 = filesystem only; Phase 2 will

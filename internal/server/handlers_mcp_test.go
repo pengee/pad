@@ -389,6 +389,61 @@ func mcpEnabledTestServer(t *testing.T) *Server {
 	return srv
 }
 
+// mcpSelfHostedTestServer builds a Server WITHOUT cloud mode + a stub
+// transport, simulating a self-hosted deployment with PAD_MCP_PUBLIC_URL
+// set. The /mcp endpoint should be reachable (not 404) and accept PAT
+// auth, same as cloud mode.
+func mcpSelfHostedTestServer(t *testing.T) *Server {
+	t.Helper()
+	srv := testServer(t)
+	// Cloud mode deliberately NOT set — this is self-hosted.
+	stub := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	})
+	// No auth-server URL — self-hosted has no OAuth.
+	srv.SetMCPTransport(stub, "https://mcp.selfhosted.example", "")
+	return srv
+}
+
+// TestMCP_SelfHosted_RoutesReachable verifies that when the MCP
+// transport is wired on a self-hosted deployment (no cloud mode),
+// the /mcp and /.well-known routes are reachable. This is the key
+// behavioral change: self-hosted no longer returns 404 on these
+// paths when PAD_MCP_PUBLIC_URL is set.
+func TestMCP_SelfHosted_RoutesReachable(t *testing.T) {
+	t.Parallel()
+	srv := mcpSelfHostedTestServer(t)
+
+	// /mcp — route is mounted but returns 401 without auth (not 404).
+	rr := doRequest(srv, "POST", "/mcp", map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+	})
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("/mcp: expected 401 (no auth) on self-hosted, got %d (body: %s)",
+			rr.Code, rr.Body.String())
+	}
+	wwwAuth := rr.Header().Get("WWW-Authenticate")
+	if wwwAuth == "" {
+		t.Error("/mcp: expected WWW-Authenticate header on 401, got empty")
+	}
+
+	// Protected-resource discovery doc — returns 200 on self-hosted
+	// (no cloud-mode guard).
+	rr2 := doRequest(srv, "GET", "/.well-known/oauth-protected-resource", nil)
+	if rr2.Code != http.StatusOK {
+		t.Errorf("protected-resource: expected 200 on self-hosted, got %d (body: %s)",
+			rr2.Code, rr2.Body.String())
+	}
+
+	// Auth-server metadata — returns 503 (OAuth server not configured
+	// on self-hosted), not 404 (route is mounted).
+	rr3 := doRequest(srv, "GET", "/.well-known/oauth-authorization-server", nil)
+	if rr3.Code == http.StatusNotFound {
+		t.Errorf("auth-server: route must be mounted on self-hosted (got 404)")
+	}
+}
+
 // =====================================================================
 // /mcp ↔ OAuth integration (sub-PR E, TASK-1027)
 // =====================================================================

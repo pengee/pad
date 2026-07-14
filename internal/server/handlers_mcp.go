@@ -7,7 +7,8 @@ import (
 )
 
 // MCP transport state. Set at startup by cmd/pad/main.go via
-// SetMCPTransport when the deployment is in cloud mode (PAD_MODE=cloud).
+// SetMCPTransport when the deployment is in cloud mode (PAD_MODE=cloud)
+// or when PAD_MCP_PUBLIC_URL is set on self-hosted.
 // Self-hosted deployments leave mcpTransport nil and the routes below
 // don't mount, so the binary stays free of MCP-server overhead unless
 // it's actually serving the public /mcp surface.
@@ -128,9 +129,9 @@ func (s *Server) handleMCPToolSurface(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write(body)
 }
 
-// registerMCPRoutes installs the /mcp + /.well-known endpoints on r,
-// gated by cloud mode. Called from setupRouter at infrastructure-
-// middleware level (NOT inside the API group), because:
+// registerMCPRoutes installs the /mcp + /.well-known endpoints on r.
+// Called from setupRouter at infrastructure- middleware level (NOT
+// inside the API group), because:
 //
 //   - /mcp uses Bearer auth (its own middleware), bypassing TokenAuth /
 //     SessionAuth / CSRFProtect / RequireAuth — those are designed for
@@ -139,11 +140,10 @@ func (s *Server) handleMCPToolSurface(w http.ResponseWriter, _ *http.Request) {
 //     "MUST be available without authentication"). Putting them inside
 //     the auth-required API group would force a special-case exemption.
 //
-// Routes mount only when SetMCPTransport has been called AND cloud mode
-// is enabled. Self-hosted deployments with no cloud secret skip this
-// entirely; deployments running cloud mode without the MCP transport
-// wired (e.g. someone testing a build with PAD_MCP_PUBLIC_URL unset)
-// also skip. No 404 leaks in either case — the routes simply don't
+// Routes mount only when SetMCPTransport has been called. Deployments
+// running without the MCP transport wired (e.g. self-hosted without
+// PAD_MCP_PUBLIC_URL set, or someone testing a build) skip this
+// entirely. No 404 leaks in either case — the routes simply don't
 // exist on the chi tree.
 //
 // Why a Get on /mcp (not just Post): MCP Streamable HTTP supports
@@ -152,7 +152,7 @@ func (s *Server) handleMCPToolSurface(w http.ResponseWriter, _ *http.Request) {
 // would also catch DELETE (session-end notifications). Use the same
 // Mount the streamable_http server expects.
 func (s *Server) registerMCPRoutes(r chi.Router) {
-	if s.mcpTransport == nil || !s.IsCloud() {
+	if s.mcpTransport == nil {
 		return
 	}
 
@@ -168,11 +168,11 @@ func (s *Server) registerMCPRoutes(r chi.Router) {
 	// captured as result_status="denied". The audit middleware is a
 	// no-op when the writer hasn't been spawned (selfhost / test
 	// builds), so the chain is safe to mount unconditionally.
-	r.With(s.requireCloudMode, s.MCPBearerAuth, s.MCPAuditLog).Mount("/mcp", s.mcpTransport)
+	r.With(s.MCPBearerAuth, s.MCPAuditLog).Mount("/mcp", s.mcpTransport)
 
-	// Discovery endpoints — unauthenticated, cloud-mode-gated. RFC 9728
-	// (protected-resource) gets the real metadata; RFC 8414 (auth-server)
-	// is the 501 stub TASK-951 fills in.
-	r.With(s.requireCloudMode).Get("/.well-known/oauth-protected-resource", s.handleOAuthProtectedResource)
-	r.With(s.requireCloudMode).Get("/.well-known/oauth-authorization-server", s.handleOAuthAuthorizationServer)
+	// Discovery endpoints — unauthenticated. RFC 9728 (protected-resource)
+	// serves the metadata doc; RFC 8414 (auth-server) gates on the
+	// OAuth server being mounted and returns 503 when it isn't.
+	r.Get("/.well-known/oauth-protected-resource", s.handleOAuthProtectedResource)
+	r.Get("/.well-known/oauth-authorization-server", s.handleOAuthAuthorizationServer)
 }
